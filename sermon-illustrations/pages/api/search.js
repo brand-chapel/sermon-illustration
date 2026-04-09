@@ -16,7 +16,6 @@ function buildSearchQuery(query, typeFilter) {
 
 async function searchYouTube(query, typeFilter = 'all', maxResults = 6) {
   const searchQuery = buildSearchQuery(query, typeFilter)
-  console.log('SEARCH QUERY:', searchQuery)
   const searchRes = await axios.get(`${YT_API}/search`, {
     params: {
       key: process.env.YOUTUBE_API_KEY,
@@ -27,7 +26,6 @@ async function searchYouTube(query, typeFilter = 'all', maxResults = 6) {
       relevanceLanguage: 'en',
     },
   })
-  console.log('YOUTUBE RAW ITEMS:', searchRes.data.items?.length)
   const videoIds = searchRes.data.items.map(v => v.id.videoId).join(',')
   const statsRes = await axios.get(`${YT_API}/videos`, {
     params: {
@@ -36,7 +34,7 @@ async function searchYouTube(query, typeFilter = 'all', maxResults = 6) {
       part: 'statistics,contentDetails,snippet',
     },
   })
-  const videos = statsRes.data.items.map(video => ({
+  return statsRes.data.items.map(video => ({
     id: video.id,
     title: video.snippet.title,
     channel: video.snippet.channelTitle,
@@ -46,21 +44,20 @@ async function searchYouTube(query, typeFilter = 'all', maxResults = 6) {
     viewCount: parseInt(video.statistics.viewCount || 0),
     url: `https://www.youtube.com/watch?v=${video.id}`,
   }))
-  console.log('VIDEOS AFTER STATS:', videos.map(v => v.title))
-  return videos
 }
 
 async function getTranscript(videoId) {
   try {
     const res = await axios.get(`https://www.youtube.com/watch?v=${videoId}`, {
-      headers: { 'Accept-Language': 'en-US,en;q=0.9' }
+      headers: { 'Accept-Language': 'en-US,en;q=0.9' },
+      timeout: 5000,
     })
     const captionMatch = res.data.match(/"captionTracks":(\[.*?\])/)
     if (!captionMatch) return null
     const tracks = JSON.parse(captionMatch[1])
     const enTrack = tracks.find(t => t.languageCode === 'en') || tracks[0]
     if (!enTrack) return null
-    const xmlRes = await axios.get(enTrack.baseUrl)
+    const xmlRes = await axios.get(enTrack.baseUrl, { timeout: 5000 })
     return xmlRes.data
       .replace(/<[^>]+>/g, ' ')
       .replace(/&amp;/g, '&')
@@ -68,11 +65,8 @@ async function getTranscript(videoId) {
       .replace(/&#39;/g, "'")
       .replace(/\s+/g, ' ')
       .trim()
-      .slice(0, 4000)
-  } catch (e) {
-    console.log('TRANSCRIPT FAILED:', e.message)
-    return null
-  }
+      .slice(0, 3000)
+  } catch { return null }
 }
 
 async function analyzeIllustration(video, transcript, searchQuery) {
@@ -81,34 +75,32 @@ async function analyzeIllustration(video, transcript, searchQuery) {
     ? `Transcript:\n${transcript}`
     : `Title: ${video.title}\nDescription: ${video.description}`
 
-  const prompt = `You are a sermon research assistant helping a pastor find illustrations.
+  const prompt = `You are a sermon research assistant. Analyze this video for a pastor looking for sermon illustrations.
 
 Search query: "${searchQuery}"
 Title: ${video.title}
 Channel: ${video.channel}
 ${context}
 
-Analyze this video and return JSON only, no markdown:
-{
-  "type": "prop|demo|visual|story",
-  "theme": "primary theological theme",
-  "passage": "best scripture reference this connects to",
-  "summary": "2-3 sentences describing what happens in this video and the spiritual point it makes",
-  "prop": "the object or prop used, or null",
-  "keyPoint": "one sentence a congregation would remember",
-  "impact": 85,
-  "reusability": 80
-}`
+Return a JSON object with these exact fields. No markdown, no backticks, just raw JSON:
+{"type":"prop","theme":"faith","passage":"John 3:16","summary":"Description of what happens and the spiritual point.","prop":"object name or null","keyPoint":"One takeaway sentence.","impact":80,"reusability":75}`
 
   const res = await anthropic.messages.create({
     model: 'claude-sonnet-4-20250514',
-    max_tokens: 500,
+    max_tokens: 400,
     messages: [{ role: 'user', content: prompt }],
   })
 
-  const text = res.content.map(b => b.text || '').join('').replace(/```json|```/g, '').trim()
-  console.log('CLAUDE RESPONSE:', text)
-  return JSON.parse(text)
+  const raw = res.content.map(b => b.text || '').join('').trim()
+  
+  // Strip any markdown fences if present
+  const cleaned = raw.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```\s*$/i, '').trim()
+  
+  // Find the JSON object even if there's extra text around it
+  const jsonMatch = cleaned.match(/\{[\s\S]*\}/)
+  if (!jsonMatch) throw new Error('No JSON found in: ' + cleaned.slice(0, 100))
+  
+  return JSON.parse(jsonMatch[0])
 }
 
 export default async function handler(req, res) {
@@ -118,13 +110,11 @@ export default async function handler(req, res) {
 
   try {
     const videos = await searchYouTube(query, type, 6)
-    console.log('PROCESSING', videos.length, 'videos')
 
     const results = await Promise.all(
       videos.slice(0, 5).map(async (video) => {
         try {
           const transcript = await getTranscript(video.id)
-          console.log('TRANSCRIPT for', video.title, ':', transcript ? 'GOT IT' : 'NULL')
           const analysis = await analyzeIllustration(video, transcript, query)
           return {
             videoId: video.id,
@@ -134,24 +124,24 @@ export default async function handler(req, res) {
             url: video.url,
             viewCount: video.viewCount,
             publishedAt: video.publishedAt,
-            type: analysis.type,
-            theme: analysis.theme,
-            passage: analysis.passage,
-            summary: analysis.summary,
-            prop: analysis.prop,
-            keyPoint: analysis.keyPoint,
-            impact: analysis.impact,
-            reusability: analysis.reusability,
+            type: analysis.type || 'prop',
+            theme: analysis.theme || 'faith',
+            passage: analysis.passage || '',
+            summary: analysis.summary || video.description,
+            prop: analysis.prop || null,
+            keyPoint: analysis.keyPoint || '',
+            impact: analysis.impact || 75,
+            reusability: analysis.reusability || 75,
           }
         } catch (e) {
-          console.log('FAILED VIDEO:', video.title, e.message)
+          console.error('FAILED:', video.title, e.message)
           return null
         }
       })
     )
 
     const final = results.filter(Boolean)
-    console.log('FINAL RESULTS COUNT:', final.length)
+    console.log('FINAL COUNT:', final.length)
     res.json({ results: final })
   } catch (err) {
     console.error('HANDLER ERROR:', err.message)

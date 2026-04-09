@@ -16,6 +16,7 @@ function buildSearchQuery(query, typeFilter) {
 
 async function searchYouTube(query, typeFilter = 'all', maxResults = 6) {
   const searchQuery = buildSearchQuery(query, typeFilter)
+  console.log('SEARCH QUERY:', searchQuery)
   const searchRes = await axios.get(`${YT_API}/search`, {
     params: {
       key: process.env.YOUTUBE_API_KEY,
@@ -26,6 +27,7 @@ async function searchYouTube(query, typeFilter = 'all', maxResults = 6) {
       relevanceLanguage: 'en',
     },
   })
+  console.log('YOUTUBE RAW ITEMS:', searchRes.data.items?.length)
   const videoIds = searchRes.data.items.map(v => v.id.videoId).join(',')
   const statsRes = await axios.get(`${YT_API}/videos`, {
     params: {
@@ -34,7 +36,7 @@ async function searchYouTube(query, typeFilter = 'all', maxResults = 6) {
       part: 'statistics,contentDetails,snippet',
     },
   })
-  return statsRes.data.items.map(video => ({
+  const videos = statsRes.data.items.map(video => ({
     id: video.id,
     title: video.snippet.title,
     channel: video.snippet.channelTitle,
@@ -44,6 +46,8 @@ async function searchYouTube(query, typeFilter = 'all', maxResults = 6) {
     viewCount: parseInt(video.statistics.viewCount || 0),
     url: `https://www.youtube.com/watch?v=${video.id}`,
   }))
+  console.log('VIDEOS AFTER STATS:', videos.map(v => v.title))
+  return videos
 }
 
 async function getTranscript(videoId) {
@@ -65,7 +69,10 @@ async function getTranscript(videoId) {
       .replace(/\s+/g, ' ')
       .trim()
       .slice(0, 4000)
-  } catch { return null }
+  } catch (e) {
+    console.log('TRANSCRIPT FAILED:', e.message)
+    return null
+  }
 }
 
 async function analyzeIllustration(video, transcript, searchQuery) {
@@ -100,6 +107,7 @@ Analyze this video and return JSON only, no markdown:
   })
 
   const text = res.content.map(b => b.text || '').join('').replace(/```json|```/g, '').trim()
+  console.log('CLAUDE RESPONSE:', text)
   return JSON.parse(text)
 }
 
@@ -110,11 +118,13 @@ export default async function handler(req, res) {
 
   try {
     const videos = await searchYouTube(query, type, 6)
+    console.log('PROCESSING', videos.length, 'videos')
 
     const results = await Promise.all(
       videos.slice(0, 5).map(async (video) => {
         try {
           const transcript = await getTranscript(video.id)
+          console.log('TRANSCRIPT for', video.title, ':', transcript ? 'GOT IT' : 'NULL')
           const analysis = await analyzeIllustration(video, transcript, query)
           return {
             videoId: video.id,
@@ -133,13 +143,18 @@ export default async function handler(req, res) {
             impact: analysis.impact,
             reusability: analysis.reusability,
           }
-        } catch { return null }
+        } catch (e) {
+          console.log('FAILED VIDEO:', video.title, e.message)
+          return null
+        }
       })
     )
 
-    res.json({ results: results.filter(Boolean) })
+    const final = results.filter(Boolean)
+    console.log('FINAL RESULTS COUNT:', final.length)
+    res.json({ results: final })
   } catch (err) {
-    console.error('Search error:', err)
+    console.error('HANDLER ERROR:', err.message)
     res.status(500).json({ error: err.message || 'Search failed' })
   }
 }

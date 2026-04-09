@@ -4,15 +4,14 @@ import Anthropic from '@anthropic-ai/sdk'
 const YT_API = 'https://www.googleapis.com/youtube/v3'
 
 function buildSearchQuery(query, typeFilter) {
-  const base = `sermon illustration "${query}"`
   const typeMap = {
-    prop: 'object lesson prop sermon',
-    demo: 'sermon demonstration stage crowd',
-    visual: 'visual aid sermon',
-    story: 'sermon story illustration',
+    prop: 'pastor prop object stage sermon adult',
+    demo: 'pastor demonstration congregation stage sermon',
+    visual: 'pastor visual aid sermon illustration adult',
+    story: 'pastor story illustration sermon',
   }
-  const typeSuffix = typeMap[typeFilter] || 'sermon object lesson'
-  return `${base} ${typeSuffix}`
+  const typeSuffix = typeMap[typeFilter] || 'pastor sermon illustration stage adult church'
+  return `${query} ${typeSuffix}`
 }
 
 async function searchYouTube(query, typeFilter = 'all', maxResults = 6) {
@@ -25,7 +24,6 @@ async function searchYouTube(query, typeFilter = 'all', maxResults = 6) {
       type: 'video',
       maxResults,
       relevanceLanguage: 'en',
-      videoCaption: 'closedCaption',
     },
   })
   const videoIds = searchRes.data.items.map(v => v.id.videoId).join(',')
@@ -59,23 +57,48 @@ async function getTranscript(videoId) {
     const enTrack = tracks.find(t => t.languageCode === 'en') || tracks[0]
     if (!enTrack) return null
     const xmlRes = await axios.get(enTrack.baseUrl)
-    return xmlRes.data.replace(/<[^>]+>/g, ' ').replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/\s+/g, ' ').trim().slice(0, 4000)
+    return xmlRes.data
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/&amp;/g, '&')
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 4000)
   } catch { return null }
 }
 
 async function analyzeIllustration(video, transcript, searchQuery) {
   const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
-  const context = transcript ? `Transcript:\n${transcript}` : `Title: ${video.title}\nDescription: ${video.description}`
-  const prompt = `You are a sermon research assistant. Search query: "${searchQuery}"
-Title: ${video.title}, Channel: ${video.channel}
+  const context = transcript
+    ? `Transcript:\n${transcript}`
+    : `Title: ${video.title}\nDescription: ${video.description}`
+
+  const prompt = `You are a sermon research assistant helping a pastor find illustrations.
+
+Search query: "${searchQuery}"
+Title: ${video.title}
+Channel: ${video.channel}
 ${context}
-Return JSON only: {"isIllustration":true,"type":"prop|demo|visual|story","theme":"theme","passage":"scripture","summary":"what happened on stage","prop":"object or null","keyPoint":"one takeaway","impact":85,"reusability":80}
-If not a sermon illustration, set isIllustration to false.`
+
+Analyze this video and return JSON only, no markdown:
+{
+  "type": "prop|demo|visual|story",
+  "theme": "primary theological theme",
+  "passage": "best scripture reference this connects to",
+  "summary": "2-3 sentences describing what happens in this video and the spiritual point it makes",
+  "prop": "the object or prop used, or null",
+  "keyPoint": "one sentence a congregation would remember",
+  "impact": 85,
+  "reusability": 80
+}`
+
   const res = await anthropic.messages.create({
     model: 'claude-sonnet-4-20250514',
     max_tokens: 500,
     messages: [{ role: 'user', content: prompt }],
   })
+
   const text = res.content.map(b => b.text || '').join('').replace(/```json|```/g, '').trim()
   return JSON.parse(text)
 }
@@ -84,18 +107,36 @@ export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).end()
   const { query, type } = req.body
   if (!query) return res.status(400).json({ error: 'Query required' })
+
   try {
     const videos = await searchYouTube(query, type, 6)
+
     const results = await Promise.all(
-      videos.slice(0, 4).map(async (video) => {
+      videos.slice(0, 5).map(async (video) => {
         try {
           const transcript = await getTranscript(video.id)
           const analysis = await analyzeIllustration(video, transcript, query)
-          if (!analysis.isIllustration) return null
-          return { videoId: video.id, ...video, ...analysis }
+          return {
+            videoId: video.id,
+            title: video.title,
+            channel: video.channel,
+            thumbnail: video.thumbnail,
+            url: video.url,
+            viewCount: video.viewCount,
+            publishedAt: video.publishedAt,
+            type: analysis.type,
+            theme: analysis.theme,
+            passage: analysis.passage,
+            summary: analysis.summary,
+            prop: analysis.prop,
+            keyPoint: analysis.keyPoint,
+            impact: analysis.impact,
+            reusability: analysis.reusability,
+          }
         } catch { return null }
       })
     )
+
     res.json({ results: results.filter(Boolean) })
   } catch (err) {
     console.error('Search error:', err)
